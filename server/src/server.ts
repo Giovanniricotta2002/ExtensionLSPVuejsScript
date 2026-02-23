@@ -3,10 +3,8 @@
  * Licensed under the MIT License. See License.txt in the project root for license information.
  * ------------------------------------------------------------------------------------------ */
 import * as ts from 'typescript';
-import * as fs from 'fs';
-import * as acorn from 'acorn';
+// import * as fs from 'fs';
 
-import { Node } from 'acorn';
 
 import {
 	CompletionItem,
@@ -21,8 +19,6 @@ import {
 } from 'vscode-languageserver-textdocument';
 import { parse } from '@vue/compiler-sfc';
 
-
-
 /** -----LogLevel---- */
 const logLevelArg = process.argv.find(arg => arg.startsWith('--log-level='));
 const logLevel = logLevelArg ? logLevelArg.split('=')[1] : 'info';
@@ -32,293 +28,299 @@ function log(msg: string, level: 'info'|'debug' = 'info') {
 }
 /** -----LogLevel---- */
 
-
-/** -----Types---- */
-type TypeNode = 
-	| { type: 'String'|'Number'|'Boolean'|'Any' }
-	| { type: 'Array', elementType: TypeNode }
-	| { type: 'Object', properties: Record<string, TypeNode> }
-	| { type: 'Function', returnType?: TypeNode };
-
-interface VueSymbols {
-	data: Record<string, TypeNode>;
-	computed: Record<string, TypeNode>;
-	methods: Record<string, TypeNode>;
-	filters: Record<string, TypeNode>;
-	hooks: Record<string, TypeNode>;
-	options: Record<string, TypeNode>;
-};
-/** -----Types---- */
-
 /** -----Parse Vue Script---- */
-function parseVueScript(content: string): string {
-	const { script } = parse({source: content});
-	// console.log('parseVueScript::parse', script);
-	
-	return script?.content ??  '';
-}
-/** -----Parse Vue Script---- */
+function parseVueScript(content: string): {
+	script: string;
+	scriptStartOffset: number;
+	mapExportOffset: (originalPos: number) => number;
+} {
+	const { script } = parse({ source: content });
+	if (!script) { return { script: '', scriptStartOffset: 0, mapExportOffset: (p) => p }; }
 
-/** -----Infer Type---- */
-function inferType(node: Node): TypeNode {
-	switch(node.type) {
-		case 'Literal':
-			if (typeof (node as acorn.Literal).value === 'string') {return { type: 'String'};}
-			if (typeof (node as acorn.Literal).value === 'number') {return { type: 'Number'};}
-			if (typeof (node as acorn.Literal).value === 'boolean') {return { type: 'Boolean'};}
-			return {type: 'Any'};
-		case 'ArrayExpression':{
-			const arrayNode = node as acorn.ArrayExpression;
-			const first = arrayNode.elements[0];
-			return { type :'Array', elementType: first ? inferType(first) : { type : 'Any' } };
-		}
-		case 'ObjectExpression': {
-			const props: Record<string, TypeNode> = {};
-			for (const p of (node as acorn.ObjectExpression).properties) {
-				if (p.type == 'SpreadElement') {
-					const spred = p as acorn.SpreadElement;
-					const argument = spred.argument as acorn.Identifier;
-					props['__spread__'+(argument.name || 'unknown')] = { type: 'Any' };
-				}
-				else {
-					// eslint-disable-next-line @typescript-eslint/no-explicit-any
-					const c = p as any;
-					props[c.key.name || c.key.value] = inferType(p.value);
-				}
-			}
+	const original = script.content;
+	const match = original.match(/export\s+default/);
+	const replaced = original.replace(/export\s+default/, 'const __VLS_component');
 
-			return { type: 'Object', properties: props };
-		}
-		case 'FunctionExpression':
-		case 'ArrowFunctionExpression':
-			return { type: 'Function', returnType: { type: 'Any' } };
-		default: return { type: 'Any' };
-	}
-}
-/** -----Infer Type---- */
+	const matchIndex = match ? match.index! : -1;
+	const matchLen   = match ? match[0].length : 0;
+	const replLen    = 'const __VLS_component'.length;
+	const delta      = replLen - matchLen;
 
-/** -----Extract export default---- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function findExportDefault(node: Node): any {
-	if (node.type === 'ExportDefaultDeclaration') {return (node as acorn.ExportDefaultDeclaration).declaration;}
-	for (const k in node) {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const child = (node as any)[k];
-		if (Array.isArray(child)) {
-			for (const c of child) {
-				const res = findExportDefault(c);
-				if (res) {return res;}
-			}
-		} else if (child && typeof child == 'object') {
-			const res = findExportDefault(child);
-			if (res) {return res;}
-		}
-	}
-	return null;
-}
-/** -----Extract export default---- */
-
-/** -----Extract object keys---- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractObjectKeys(objNode: any, propName: string): Record<string, TypeNode> {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const prop = objNode.properties.find((p: any) => p.key.name === propName);
-	if(!prop) {return {};}
-	if (prop.value.type === 'FunctionExpression') {
-		const result: Record<string, TypeNode> = {};
-		for (const p of prop.value.body.body) {
-			console.log('extractObjectKeys::props', p);
-			if (p.type === 'ReturnStatement') {
-				console.log('extractObjectKeys::ReturnStatement', p);
-				const argument = p.argument;
-				for (const propertie of argument.properties) {
-					if (propertie.type === 'SpreadElement') {
-						console.log('extractObjectKeys::SpreadElement', p);
-						result['__spread__'+(p.argument.name || 'unknown')] = {type: 'Any' };
-					} else {
-						console.log('extractObjectKeys::propertie', propertie);
-						result[propertie.key.name || propertie.key.value] = inferType(propertie.value);
-					}
-				}
-			}
-		}
-		return result;
-	} else if (prop.value.type === 'ObjectExpression') {
-		const result: Record<string, TypeNode> = {};
-
-		for (const p of prop.value.properties) {
-			if (p.type === 'SpreadElement') {
-				result['__spread__'+(p.argument.name || 'unknown')] = {type: 'Any' };
-			} else if (p.value.type === 'FunctionExpression' || p.value.type === 'ArrowFunctionExpression') {
-				result[p.key.name || p.key.value] = { type: 'Function', returnType: { type: 'Any' } };
-			}
-			else {
-				result[p.key.name||p.key.value] = inferType(p.value);
-			}
-		}
-		return result;
-	}
-	return {};
-}
-/** -----Extract object keys---- */
-
-/** -----Extract hooks using types Vue 2---- */
-function extractLifecylceHooksFromTypes(): Record<string, TypeNode> {
-	const hooks: Record<string, TypeNode> = {};
-
-	// charger vue/types/vue.d.ts
-	const vueTypesPath = require.resolve('vue/types/vue');
-	const program = ts.createProgram([vueTypesPath], {allowJs: true});
-	const sourceFile = program.getSourceFile(vueTypesPath);
-	if (!sourceFile) {return hooks;}
-
-	ts.forEachChild(sourceFile, node => {
-		if (ts.isInterfaceDeclaration(node) && node.name.text === 'Vue') {
-			node.members.forEach(member => {
-				if(ts.isMethodSignature(member) && member.name) {
-					if (ts.isIdentifier(member.name)) {
-						const name = member.name.text;
-						if (
-							name.endsWith('Created')
-							|| name.endsWith('Mount')
-							|| name.endsWith('Update')
-							|| name.endsWith('Destroy')
-							|| name.endsWith('Activate')
-							|| name.endsWith('Deactivate')
-						) {
-							hooks[name] = { type: 'Function', returnType: { type: 'Any' } };
-						}
-					}
-				}
-			});
-		}
-	});
-
-	return hooks;
-}
-/** -----Extract hooks using types Vue 2---- */
-
-/** -----Analyze Vue Script---- */
-function analyzeVueScript(filePath: string): VueSymbols {
-	const content = fs.readFileSync(filePath, 'utf-8');
-	const script = parseVueScript(content);
-	try {
-		const ast = acorn.parse(script, { ecmaVersion: 'latest', sourceType: 'module'});
-		const exportNode = findExportDefault(ast);
-		if(!exportNode) {return {data: {}, computed: {}, methods: {}, filters: {}, hooks: {}, options: {}};}
-		log(`Analyse AST pour ${filePath}`, 'debug');
-		return {
-			data: extractObjectKeys(exportNode, 'data'),
-			computed: extractObjectKeys(exportNode, 'computed'),
-			methods: extractObjectKeys(exportNode, 'methods'),
-			filters: extractObjectKeys(exportNode, 'filters'),
-			hooks: extractLifecylceHooksFromTypes(),
-			options: extractObjectKeys(exportNode, 'props'),
-		};
-	} catch (e) {
-		console.log('erreur: ', e);
-		return {data: {}, computed: {}, methods: {}, filters: {}, hooks: {}, options: {}};
-	}
-	
-	
-}
-/** -----Analyze Vue Script---- */
-
-function getJsPrototypeKes(type:TypeNode): CompletionItem[] {
-	if (!type) {
-		return [];
+	function mapExportOffset(originalPos: number): number {
+		if (matchIndex < 0 || originalPos <= matchIndex) { return originalPos; }
+		if (originalPos < matchIndex + matchLen) { return matchIndex + replLen; }
+		return originalPos + delta;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const protoMap: Record<string, any> = {
-		Array: Array.prototype,
-		String: String.prototype,
-		Number: Number.prototype,
-		Boolean: Boolean.prototype,
-		Function: Function.prototype,
+	return {
+		script: replaced,
+		scriptStartOffset: script.start,
+		mapExportOffset,
 	};
-
-	const proto = protoMap[type.type];
-	if (!proto) {
-		return [];
-	}
-
-	return Object.getOwnPropertyNames(proto).map(name => ({
-		label: name,
-		kind: typeof proto[name] === 'function' ? CompletionItemKind.Method : CompletionItemKind.Property
-	}));
 }
+/** -----Parse Vue Script---- */
 
-function generateCompletionsFromType(type?: TypeNode|null): CompletionItem[] {
-	if(!type) {return [];}
-	if (type.type === 'Object' && type.properties) {
-		return Object.entries(type.properties).map(([key, val]) => ({
-			label: key,
-			kind: val.type === 'Function' ? CompletionItemKind.Method : CompletionItemKind.Property
-		}));
-	}
+/** -----Inject this: __VLS_Context---- */
+function injectThisParam(scriptContent: string): {
+	result: string;
+	mapOffset: (originalPos: number) => number;
+} {
+	const sf = ts.createSourceFile('v.ts', scriptContent, ts.ScriptTarget.Latest, true);
+	const insertions: { pos: number; text: string }[] = [];
 
-	if (type.type === 'Array' && type.elementType) {
-		console.log('generateCompletionsFromType::type', type, type.elementType);
-		const arrayMethods = getJsPrototypeKes({ type: 'Array', elementType: type.elementType});
-		
-		if (type.elementType?.type === 'Any') {
-			return arrayMethods;
+	function isInsideVLSComponent(node: ts.Node): boolean {
+		let cur: ts.Node | undefined = node.parent;
+		while (cur) {
+			if (
+				ts.isVariableDeclaration(cur) &&
+				ts.isIdentifier(cur.name) &&
+				cur.name.text === '__VLS_component'
+			) { return true; }
+			cur = cur.parent;
 		}
-		
-		return [
-			...arrayMethods,
-			...generateCompletionsFromType(type.elementType)
-		];
+		return false;
 	}
 
-	return getJsPrototypeKes(type);
+	// Clés de __VLS_component dont TOUTES les fonctions imbriquées
+	// ne doivent PAS recevoir this: __VLS_Context
+	// (leur type de retour alimente __VLS_Context → circularité si this est typé)
+	const NO_INJECT_KEYS = new Set(['data', 'computed']);
+
+	// Retourne la clé de premier niveau dans __VLS_component qui contient ce nœud.
+	// Ex: data()             → 'data'
+	//     pistache() dans computed → 'computed'
+	//     mounted()          → 'mounted'
+	function getTopLevelVLSKey(node: ts.FunctionExpression | ts.MethodDeclaration): string | null {
+		// Initialiser avec la clé propre du nœud (cas : enfant direct de __VLS_component)
+		let lastKey: string | null = null;
+		if (ts.isMethodDeclaration(node)) {
+			const k = node.name;
+			if (ts.isIdentifier(k) || ts.isStringLiteral(k)) { lastKey = k.text; }
+		} else if (ts.isFunctionExpression(node) && ts.isPropertyAssignment(node.parent)) {
+			const k = (node.parent as ts.PropertyAssignment).name;
+			if (ts.isIdentifier(k) || ts.isStringLiteral(k)) { lastKey = k.text; }
+		}
+
+		// Remonter : le dernier MethodDeclaration/PropertyAssignment rencontré
+		// avant __VLS_component est la clé de premier niveau.
+		let cur: ts.Node | undefined = node.parent;
+		while (cur) {
+			if (
+				ts.isVariableDeclaration(cur) &&
+				ts.isIdentifier(cur.name) &&
+				cur.name.text === '__VLS_component'
+			) { return lastKey; }
+			if (ts.isMethodDeclaration(cur) || ts.isPropertyAssignment(cur)) {
+				const nameNode = (cur as ts.MethodDeclaration | ts.PropertyAssignment).name;
+				if (ts.isIdentifier(nameNode) || ts.isStringLiteral(nameNode)) {
+					lastKey = nameNode.text;
+				}
+			}
+			cur = cur.parent;
+		}
+		return null;
+	}
+
+	function visit(node: ts.Node) {
+		if (ts.isFunctionExpression(node) || ts.isMethodDeclaration(node)) {
+			if (isInsideVLSComponent(node)) {
+				const topKey = getTopLevelVLSKey(node);
+				if (topKey && NO_INJECT_KEYS.has(topKey)) {
+					// Pas d'injection sous data/computed : évite la circularité
+					// (this. dans ces fonctions passe par le fallback __VLS_ctx. de onCompletion)
+					ts.forEachChild(node, visit);
+					return;
+				}
+				const firstParam = node.parameters[0];
+				const alreadyHasThis =
+					firstParam &&
+					ts.isIdentifier(firstParam.name) &&
+					firstParam.name.text === 'this';
+				if (!alreadyHasThis) {
+					const hasOtherParams = node.parameters.length > 0;
+					insertions.push({
+						pos: node.parameters.pos,
+						text: hasOtherParams ? 'this: __VLS_Context, ' : 'this: __VLS_Context',
+					});
+				}
+			}
+		}
+		ts.forEachChild(node, visit);
+	}
+	visit(sf);
+
+	// Tri croissant pour le mapping d'offset
+	const sortedAsc = [...insertions].sort((a, b) => a.pos - b.pos);
+
+	// Pour chaque position originale, calcule la position dans le texte injecté
+	function mapOffset(originalPos: number): number {
+		let shift = 0;
+		for (const ins of sortedAsc) {
+			// L'insertion est avant ou au niveau du curseur original → décale
+			if (ins.pos <= originalPos) {
+				shift += ins.text.length;
+			} else {
+				break;
+			}
+		}
+		return originalPos + shift;
+	}
+
+	// Appliquer en ordre inverse pour ne pas décaler les positions
+	insertions.sort((a, b) => b.pos - a.pos);
+	let result = scriptContent;
+	for (const ins of insertions) {
+		result = result.slice(0, ins.pos) + ins.text + result.slice(ins.pos);
+	}
+	return { result, mapOffset };
 }
+/** -----Inject this: __VLS_Context---- */
 
-function resolveExpressionType(expression: string, symbols: VueSymbols): TypeNode | null {
-	const parts = expression
-		.replace(/\[(\d+)\]/g, '.$1')
-		.split('.')
-		.filter(Boolean);
 
-	if (parts.length === 0) {
-		return null;
-	}
-	if (parts[0] !== 'this') {
-		return null;
-	}
+/** -----Strip SpreadAssignments from data()---- */
+// Les ...spread dans le return de data() typent infos comme any → retour any → __VLS_Data = any.
+// On les supprime du script virtuel : les propriétés explicites restent et sont bien inférées.
+function stripSpreadsFromData(scriptContent: string): string {
+	const sf = ts.createSourceFile('v.ts', scriptContent, ts.ScriptTarget.Latest, true);
+	const removals: Array<{ pos: number; end: number }> = [];
 
-	let currentType: TypeNode | undefined;
-
-	const first = parts[1];
-	currentType =
-		symbols.data[first]
-		|| symbols.computed[first]
-		|| symbols.methods[first]
-		|| symbols.options[first];
-
-	if (!currentType) {
-		return null;
-	}
-
-	for (let i = 2; i < parts.length; i++) {
-		const key = parts[i];
-		if (!currentType) {return null;}
-
-		if (currentType.type === 'Array') {
-			currentType = currentType.elementType;
-			continue;
+	function isInsideDataReturn(node: ts.Node): boolean {
+		let cur: ts.Node | undefined = node.parent;
+		let inReturn = false;
+		while (cur) {
+			if (ts.isReturnStatement(cur)) { inReturn = true; }
+			if (inReturn && ts.isMethodDeclaration(cur)) {
+				const key = cur.name;
+				if ((ts.isIdentifier(key) || ts.isStringLiteral(key)) && key.text === 'data') {
+					return true;
+				}
+			}
+			// Également gérer la forme data: function() {}
+			if (inReturn && ts.isFunctionExpression(cur) && ts.isPropertyAssignment(cur.parent)) {
+				const key = (cur.parent as ts.PropertyAssignment).name;
+				if ((ts.isIdentifier(key) || ts.isStringLiteral(key)) && key.text === 'data') {
+					return true;
+				}
+			}
+			cur = cur.parent;
 		}
-
-		if (currentType.type === 'Object') {
-			currentType = currentType.properties?.[key];
-			continue;
-		}
-
-		return null;
+		return false;
 	}
 
-	return currentType;
+	function visit(node: ts.Node) {
+		if (ts.isSpreadAssignment(node) && isInsideDataReturn(node)) {
+			// Inclure la virgule éventuelle qui suit
+			let end = node.end;
+			const after = scriptContent.slice(end, end + 2);
+			if (after.startsWith(',')) { end += 1; }
+			removals.push({ pos: node.pos, end });
+		}
+		ts.forEachChild(node, visit);
+	}
+	visit(sf);
+
+	// Appliquer en ordre inverse
+	removals.sort((a, b) => b.pos - a.pos);
+	let result = scriptContent;
+	for (const r of removals) {
+		result = result.slice(0, r.pos) + result.slice(r.end);
+	}
+	return result;
+}
+/** -----Strip SpreadAssignments from data()---- */
+
+
+
+const host: ts.LanguageServiceHost = {
+	getScriptFileNames: () => Object.keys(files),
+
+	getScriptVersion: (filename) => files[filename]?.version.toString(),
+
+	getScriptSnapshot: (fileName) => {
+		const file = files[fileName];
+		if (!file) {return undefined;}
+		return ts.ScriptSnapshot.fromString(file.content);
+	},
+
+	getCurrentDirectory: () => process.cwd(),
+
+	getCompilationSettings: () => ({
+    allowJs: true,
+    checkJs: true,
+    target: ts.ScriptTarget.ESNext,
+    module: ts.ModuleKind.ESNext,
+    strict: false
+  }),
+
+  getDefaultLibFileName: (options) =>
+    ts.getDefaultLibFilePath(options),
+
+  fileExists: ts.sys.fileExists,
+  readFile: ts.sys.readFile,
+  readDirectory: ts.sys.readDirectory
+};
+
+const languageService = ts.createLanguageService(host);
+
+
+
+function generateVirtualFile(script: string): { content: string; mapOffset: (originalPos: number) => number } {
+	// 1. Supprimer les spreads ...xxx dans data() pour éviter que any contamine le type de retour
+	const stripped = stripSpreadsFromData(script);
+	// 2. Injecter this: __VLS_Context dans les méthodes/hooks (pas data/computed)
+	const { result: injected, mapOffset } = injectThisParam(stripped);
+	const content =
+`${injected}
+
+// ---- Inférence de types depuis le composant Vue ----
+
+// data() → ReturnType évite la circularité avec this: __VLS_Context
+type __VLS_Data = typeof __VLS_component extends { data(...args: any[]): infer D } ? D : {};
+
+// computed : forme fonction ou { get() }
+type __VLS_Computed =
+  typeof __VLS_component extends { computed: infer C } ? {
+    [K in keyof C]: C[K] extends { get(this: any): infer R }
+      ? R
+      : C[K] extends (this: any, ...args: any[]) => infer R
+      ? R
+      : never;
+  } : {};
+
+// methods
+type __VLS_Methods =
+  typeof __VLS_component extends { methods: infer M } ? M : {};
+
+// props
+type __VLS_Props =
+  typeof __VLS_component extends { props: infer P } ? P : {};
+
+// Hooks de cycle de vie Vue.js
+type __VLS_Hooks = {
+  beforeCreate?(this: __VLS_Context): void;
+  created?(this: __VLS_Context): void;
+  beforeMount?(this: __VLS_Context): void;
+  mounted?(this: __VLS_Context): void;
+  beforeUpdate?(this: __VLS_Context): void;
+  updated?(this: __VLS_Context): void;
+  beforeDestroy?(this: __VLS_Context): void;
+  destroyed?(this: __VLS_Context): void;
+  beforeUnmount?(this: __VLS_Context): void;
+  unmounted?(this: __VLS_Context): void;
+  activated?(this: __VLS_Context): void;
+  deactivated?(this: __VLS_Context): void;
+  errorCaptured?(this: __VLS_Context, err: unknown, vm: unknown, info: string): boolean | void;
+};
+
+// Contexte complet
+type __VLS_Context = __VLS_Data & __VLS_Computed & __VLS_Methods & __VLS_Props & __VLS_Hooks;
+
+// Déclencheur d'autocomplétion de secours (hors corps de méthode)
+declare const __VLS_ctx: __VLS_Context;
+__VLS_ctx.
+`;
+	log(`generateVirtualFile::virtualFile:\n${content}`, 'info');
+	return { content, mapOffset };
 }
 
 /** -----LSP Setup---- */
@@ -328,67 +330,73 @@ documents.listen(connection);
 
 connection.onInitialize(() => ({ capabilities: { completionProvider: { resolveProvider: false } } }));
 connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
-	console.log("COMPLETION CALLED");
+	log("COMPLETION CALLED", 'info');
 	const doc = documents.get(params.textDocument.uri);
 	if (!doc) {return [];}
-	const filePath = doc.uri.replace('file://', '');
-	const symbols = analyzeVueScript(filePath);
-	console.log("COMPLETION CALLED", symbols);
 
-	const completions: CompletionItem[] = [];
+	const vueContent = doc.getText();
+	const { script, scriptStartOffset, mapExportOffset } = parseVueScript(vueContent);
+	const { content: virtualContent, mapOffset } = generateVirtualFile(script);
 
-	const offset = doc.offsetAt(params.position);
-	console.log('offset', offset);
-	const text = doc.getText();
-    const beforeCursor = text.slice(0, offset);
-	console.log('beforeCursor', beforeCursor);
+	const fileName = 'virtual.ts';
+	files[fileName] = {
+		version: (files[fileName]?.version ?? 0) + 1,
+		content: virtualContent,
+	};
 
-	const match = beforeCursor.match(/([a-zA-Z0-9_$.[\]]+)$/);
-    if (!match) {return completions;}
-	const expression = match[1];
-	console.log(expression);
-	
-	
-	if (expression === 'this' || expression.startsWith('this.')) {
-		const cleanExpr = expression.replace(/\.$/, '');
-		const depth = cleanExpr.split('.').length - 1;
+	const docOffset      = doc.offsetAt(params.position);
+	const relativeOffset = docOffset - scriptStartOffset;
+	const isInsideScript = relativeOffset >= 0 && relativeOffset <= script.length;
 
-		if (depth === 1) {
-			for (const key in symbols.data) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type}}`);
-				completions.push({label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type});
-			}
-			for (const key in symbols.computed) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type}}`);
-				completions.push({label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type});
-			}
-			for (const key in symbols.methods) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
-				completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
-			}
-			for (const key in symbols.filters) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: 'Function'}}`);
-				completions.push({label: key, kind: CompletionItemKind.Function, detail: 'Function'});
-			}
-			for (const key in symbols.hooks) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
-				completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
-			}
-			for (const key in symbols.options) {
-				connection.console.log(`${{label: key, kind: CompletionItemKind.Property, detail: 'Option'}}`);
-				completions.push({label: key, kind: CompletionItemKind.Property, detail: 'Option'});
-			}
+	let offset: number;
+
+	if (isInsideScript) {
+		// Texte avant le curseur dans le script original (pour détecter this. / this.xxx.)
+		const textBefore = script.slice(0, mapExportOffset(relativeOffset));
+
+		// Cas 1 : this.xxx.  → complétion sur le type de xxx
+		const chainMatch = textBefore.match(/\bthis\.(\w+)\.$/);
+		if (chainMatch) {
+			const prop = chainMatch[1];
+			// On place le curseur après "__VLS_ctx.<prop>." dans le fichier virtuel
+			const chainMarker = `__VLS_ctx.${prop}.`;
+			// Injecter une ligne de complétion chaînée à la fin du fichier virtuel
+			const chainedContent = virtualContent.replace(
+				/declare const __VLS_ctx: __VLS_Context;\n__VLS_ctx\.\n/,
+				`declare const __VLS_ctx: __VLS_Context;\n__VLS_ctx.${prop}.\n`
+			);
+			files[fileName] = {
+				version: (files[fileName].version) + 1,
+				content: chainedContent,
+			};
+			offset = chainedContent.lastIndexOf(chainMarker) + chainMarker.length;
+			log(`Chain completion: this.${prop}. → offset ${offset}`, 'info');
+
+		// Cas 2 : this.  → complétion sur __VLS_Context (data + computed + methods + hooks)
+		} else if (textBefore.match(/\bthis\.$/)) {
+			const marker = '__VLS_ctx.';
+			offset = virtualContent.lastIndexOf(marker) + marker.length;
+			log(`this. completion → fallback offset ${offset}`, 'info');
+
+		// Cas 3 : position brute dans le script → variables locales, globals, etc.
+		} else {
+			const afterExport = mapExportOffset(relativeOffset);
+			offset = mapOffset(afterExport);
+			log(`Raw cursor mapped: rel=${relativeOffset} export=${afterExport} virtual=${offset}`, 'info');
 		}
-
-		if (depth >= 2) {
-			const resolvedType = resolveExpressionType(cleanExpr, symbols);
-			if (!resolvedType) {return [];}
-			generateCompletionsFromType(resolvedType).forEach(v => completions.push(v));
-		}
+	} else {
+		const marker = '__VLS_ctx.';
+		offset = virtualContent.lastIndexOf(marker) + marker.length;
+		log(`Outside script, fallback offset ${offset}`, 'debug');
 	}
 
+	const completions = languageService.getCompletionsAtPosition(fileName, offset, {});
+	if (!completions) {return [];}
 
-	return completions;
+	return completions.entries.map(entry => ({
+		label: entry.name,
+		kind: CompletionItemKind.Property,
+	}));
 });
 
 connection.listen();
