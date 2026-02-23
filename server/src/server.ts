@@ -224,6 +224,103 @@ function analyzeVueScript(filePath: string): VueSymbols {
 }
 /** -----Analyze Vue Script---- */
 
+function getJsPrototypeKes(type:TypeNode): CompletionItem[] {
+	if (!type) {
+		return [];
+	}
+
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const protoMap: Record<string, any> = {
+		Array: Array.prototype,
+		String: String.prototype,
+		Number: Number.prototype,
+		Boolean: Boolean.prototype,
+		Function: Function.prototype,
+	};
+
+	const proto = protoMap[type.type];
+	if (!proto) {
+		return [];
+	}
+
+	return Object.getOwnPropertyNames(proto).map(name => ({
+		label: name,
+		kind: typeof proto[name] === 'function' ? CompletionItemKind.Method : CompletionItemKind.Property
+	}));
+}
+
+function generateCompletionsFromType(type?: TypeNode|null): CompletionItem[] {
+	if(!type) {return [];}
+	if (type.type === 'Object' && type.properties) {
+		return Object.entries(type.properties).map(([key, val]) => ({
+			label: key,
+			kind: val.type === 'Function' ? CompletionItemKind.Method : CompletionItemKind.Property
+		}));
+	}
+
+	if (type.type === 'Array' && type.elementType) {
+		console.log('generateCompletionsFromType::type', type, type.elementType);
+		const arrayMethods = getJsPrototypeKes({ type: 'Array', elementType: type.elementType});
+		
+		if (type.elementType?.type === 'Any') {
+			return arrayMethods;
+		}
+		
+		return [
+			...arrayMethods,
+			...generateCompletionsFromType(type.elementType)
+		];
+	}
+
+	return getJsPrototypeKes(type);
+}
+
+function resolveExpressionType(expression: string, symbols: VueSymbols): TypeNode | null {
+	const parts = expression
+		.replace(/\[(\d+)\]/g, '.$1')
+		.split('.')
+		.filter(Boolean);
+
+	if (parts.length === 0) {
+		return null;
+	}
+	if (parts[0] !== 'this') {
+		return null;
+	}
+
+	let currentType: TypeNode | undefined;
+
+	const first = parts[1];
+	currentType =
+		symbols.data[first]
+		|| symbols.computed[first]
+		|| symbols.methods[first]
+		|| symbols.options[first];
+
+	if (!currentType) {
+		return null;
+	}
+
+	for (let i = 2; i < parts.length; i++) {
+		const key = parts[i];
+		if (!currentType) {return null;}
+
+		if (currentType.type === 'Array') {
+			currentType = currentType.elementType;
+			continue;
+		}
+
+		if (currentType.type === 'Object') {
+			currentType = currentType.properties?.[key];
+			continue;
+		}
+
+		return null;
+	}
+
+	return currentType;
+}
+
 /** -----LSP Setup---- */
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
@@ -240,30 +337,56 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
 
 	const completions: CompletionItem[] = [];
 
-	for (const key in symbols.data) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type}}`);
-		completions.push({label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type});
+	const offset = doc.offsetAt(params.position);
+	console.log('offset', offset);
+	const text = doc.getText();
+    const beforeCursor = text.slice(0, offset);
+	console.log('beforeCursor', beforeCursor);
+
+	const match = beforeCursor.match(/([a-zA-Z0-9_$.[\]]+)$/);
+    if (!match) {return completions;}
+	const expression = match[1];
+	console.log(expression);
+	
+	
+	if (expression === 'this' || expression.startsWith('this.')) {
+		const cleanExpr = expression.replace(/\.$/, '');
+		const depth = cleanExpr.split('.').length - 1;
+
+		if (depth === 1) {
+			for (const key in symbols.data) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type}}`);
+				completions.push({label: key, kind: CompletionItemKind.Variable, detail: symbols.data[key].type});
+			}
+			for (const key in symbols.computed) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type}}`);
+				completions.push({label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type});
+			}
+			for (const key in symbols.methods) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
+				completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
+			}
+			for (const key in symbols.filters) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: 'Function'}}`);
+				completions.push({label: key, kind: CompletionItemKind.Function, detail: 'Function'});
+			}
+			for (const key in symbols.hooks) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
+				completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
+			}
+			for (const key in symbols.options) {
+				connection.console.log(`${{label: key, kind: CompletionItemKind.Property, detail: 'Option'}}`);
+				completions.push({label: key, kind: CompletionItemKind.Property, detail: 'Option'});
+			}
+		}
+
+		if (depth >= 2) {
+			const resolvedType = resolveExpressionType(cleanExpr, symbols);
+			if (!resolvedType) {return [];}
+			generateCompletionsFromType(resolvedType).forEach(v => completions.push(v));
+		}
 	}
-	for (const key in symbols.computed) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type}}`);
-		completions.push({label: key, kind: CompletionItemKind.Function, detail: symbols.computed[key].type});
-	}
-	for (const key in symbols.methods) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
-		completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
-	}
-	for (const key in symbols.filters) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Function, detail: 'Function'}}`);
-		completions.push({label: key, kind: CompletionItemKind.Function, detail: 'Function'});
-	}
-	for (const key in symbols.hooks) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Method, detail: 'Function'}}`);
-		completions.push({label: key, kind: CompletionItemKind.Method, detail: 'Function'});
-	}
-	for (const key in symbols.options) {
-		connection.console.log(`${{label: key, kind: CompletionItemKind.Property, detail: 'Option'}}`);
-		completions.push({label: key, kind: CompletionItemKind.Property, detail: 'Option'});
-	}
+
 
 	return completions;
 });
